@@ -34,6 +34,8 @@
 
 namespace dflash::common {
 
+class LagunaMixedBackend;
+
 struct LagunaBackendArgs {
     std::string target_path;
     std::string draft_path;
@@ -94,6 +96,11 @@ public:
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
 
 private:
+    // The opt-in mixed backend deliberately reuses the exact same model,
+    // cache, placement and decode state.  Friendship keeps that integration
+    // explicit without widening the public backend API.
+    friend class LagunaMixedBackend;
+
     LagunaBackendArgs                           args_;
     ggml_backend_t                              backend_   = nullptr;
     ggml_backend_t                              snap_backend_ = nullptr;
