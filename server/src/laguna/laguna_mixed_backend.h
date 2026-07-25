@@ -17,6 +17,7 @@
 #pragma once
 
 #include "laguna_backend.h"
+#include "common/gpu_runtime_compat.h"
 #include "common/step_graph.h"
 
 #include "ggml-alloc.h"
@@ -96,7 +97,9 @@ private:
     }
 
     int mixed_prefill_chunk() const {
-        int value = 256;
+        // Larger chunks amortize attention-graph rebuild + host routing I/O.
+        // Cap by args_.chunk (server --chunk, default 512–2048).
+        int value = 1024;
         if (const char * e = std::getenv("DFLASH_LAGUNA_MIXED_PREFILL_CHUNK")) {
             const int parsed = std::atoi(e);
             if (parsed > 0) value = parsed;
@@ -138,6 +141,58 @@ private:
         st.up_hot = nullptr;
         st.down_hot = nullptr;
         st.gate_up_hot = nullptr;
+    }
+
+    // Device-to-device copy of one expert slice along dim-2 (nb[2] stride).
+    // Falls back to host bounce if device pointers are unavailable.
+    static bool copy_expert_slice(ggml_tensor * dst, int dst_e,
+                                  const ggml_tensor * src, int src_e,
+                                  size_t expert_bytes) {
+        if (!dst || !src || expert_bytes == 0 || dst_e < 0 || src_e < 0) {
+            return false;
+        }
+        const size_t dst_off = (size_t)dst_e * expert_bytes;
+        const size_t src_off = (size_t)src_e * expert_bytes;
+        if (dst->data && src->data) {
+            auto * d = static_cast<uint8_t *>(dst->data) + dst_off;
+            const auto * s = static_cast<const uint8_t *>(src->data) + src_off;
+            const cudaError_t err = cudaMemcpy(
+                d, s, expert_bytes, cudaMemcpyDeviceToDevice);
+            return err == cudaSuccess;
+        }
+        std::vector<uint8_t> tmp(expert_bytes);
+        ggml_backend_tensor_get(src, tmp.data(), src_off, expert_bytes);
+        ggml_backend_tensor_set(dst, tmp.data(), dst_off, expert_bytes);
+        return true;
+    }
+
+    bool upload_single_expert(ggml_tensor * dst, int dst_e,
+                              const ExpertFileRegion & region,
+                              size_t expert_bytes,
+                              int32_t global_id,
+                              std::string & err) const {
+        if (!dst || expert_bytes == 0 || global_id < 0 ||
+            global_id >= w_.n_expert) {
+            err = "invalid single-expert upload";
+            return false;
+        }
+        if (!moe_hybrid_ || !moe_hybrid_->mmap_data) {
+            err = "mixed prefill requires retained GGUF mmap";
+            return false;
+        }
+        const size_t full_required = expert_bytes * (size_t)w_.n_expert;
+        if (region.offset > moe_hybrid_->mmap_size ||
+            full_required > region.size ||
+            region.offset + full_required > moe_hybrid_->mmap_size) {
+            err = "expert tensor region outside retained GGUF mmap";
+            return false;
+        }
+        const auto * src = static_cast<const uint8_t *>(moe_hybrid_->mmap_data)
+                         + region.offset
+                         + (size_t)global_id * expert_bytes;
+        ggml_backend_tensor_set(dst, src, (size_t)dst_e * expert_bytes,
+                                expert_bytes);
+        return true;
     }
 
     static ggml_tensor * new_expert_tensor(ggml_context * ctx,
@@ -306,15 +361,161 @@ private:
         return per_expert * (size_t)w_.n_expert;
     }
 
+    // Build empty GPU expert stack (allocate + zero) without uploads.
+    bool allocate_hot_shell(MoeHybridLayerStorage & st,
+                            const MoeLayerDesc & desc,
+                            const std::vector<int32_t> & hot_ids,
+                            int cache_slots,
+                            std::string & err) {
+        const int active = (int)hot_ids.size();
+        const int allocated = active + std::max(0, cache_slots);
+        if (active <= 0 || allocated <= 0) {
+            err = "cannot allocate an empty hot expert stack";
+            return false;
+        }
+
+        ggml_init_params ip{};
+        ip.mem_size = 16 * ggml_tensor_overhead();
+        ip.no_alloc = true;
+        st.hot_ctx = ggml_init(ip);
+        if (!st.hot_ctx) {
+            err = "mixed hot_ctx allocation failed";
+            return false;
+        }
+
+        if (st.fused_gate_up) {
+            st.gate_up_hot = new_expert_tensor(st.hot_ctx, desc.ffn_gate_up_exps,
+                                               allocated);
+            st.down_hot = new_expert_tensor(st.hot_ctx, desc.ffn_down_exps,
+                                            allocated);
+        } else {
+            st.gate_hot = new_expert_tensor(st.hot_ctx, desc.ffn_gate_exps,
+                                            allocated);
+            st.up_hot = new_expert_tensor(st.hot_ctx, desc.ffn_up_exps,
+                                          allocated);
+            st.down_hot = new_expert_tensor(st.hot_ctx, desc.ffn_down_exps,
+                                            allocated);
+        }
+
+        st.hot_buf = ggml_backend_alloc_ctx_tensors(st.hot_ctx, backend_);
+        if (!st.hot_buf) {
+            err = "mixed full-layer GPU allocation failed";
+            release_hot_storage(st);
+            return false;
+        }
+        ggml_backend_buffer_set_usage(st.hot_buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+        ggml_backend_buffer_clear(st.hot_buf, 0);
+
+        st.hot_expert_ids = hot_ids;
+        st.hot_active = active;
+        st.cache_slots = std::max(0, cache_slots);
+        st.spare_global.assign((size_t)st.cache_slots, -1);
+        st.spare_lru.assign((size_t)st.cache_slots, 0);
+        st.lru_clock = 0;
+
+        st.hot_local_by_global.assign((size_t)w_.n_expert, -1);
+        st.cold_local_by_global.assign((size_t)w_.n_expert, -1);
+        std::memset(st.expert_vram_mask, 0, sizeof(st.expert_vram_mask));
+        for (size_t i = 0; i < hot_ids.size(); ++i) {
+            const int32_t id = hot_ids[i];
+            st.hot_local_by_global[(size_t)id] = (int32_t)i;
+            if (id >= 0 && id < 256) {
+                st.expert_vram_mask[id >> 6] |= 1ULL << (id & 63);
+            }
+        }
+        for (size_t i = 0; i < st.cold_expert_ids.size(); ++i) {
+            const int32_t id = st.cold_expert_ids[i];
+            if (id >= 0 && id < w_.n_expert &&
+                st.hot_local_by_global[(size_t)id] < 0) {
+                st.cold_local_by_global[(size_t)id] = (int32_t)i;
+            }
+        }
+        free_hot_graphs(st);
+        return true;
+    }
+
+    // Pack identity full-stack GPU weights → compact hot subset (D2D only).
     bool restore_pinned_layer(int il,
                               const PinnedPlacement & saved,
                               std::string & err) {
         auto & st = moe_hybrid_->layers[(size_t)il];
         const MoeLayerDesc desc = make_moe_layer_desc(w_.layers[(size_t)il]);
-        const auto & regions = moe_hybrid_->layer_regions[(size_t)il];
-        release_hot_storage(st);
-        if (!allocate_hot_storage(st, desc, regions, saved.hot_ids,
-                                  saved.cache_slots, false, err)) {
+
+        // Already at the desired placement (e.g. layer was fully hot and
+        // staging was a no-op).
+        if ((int)saved.hot_ids.size() == st.hot_active &&
+            saved.hot_ids == st.hot_expert_ids &&
+            saved.cache_slots == st.cache_slots) {
+            return true;
+        }
+
+        // Snapshot current full-stack tensors (identity 0..n_expert-1).
+        ggml_tensor * src_gu = st.gate_up_hot;
+        ggml_tensor * src_g  = st.gate_hot;
+        ggml_tensor * src_u  = st.up_hot;
+        ggml_tensor * src_d  = st.down_hot;
+        ggml_backend_buffer_t src_buf = st.hot_buf;
+        ggml_context * src_ctx = st.hot_ctx;
+        const bool had_full =
+            st.hot_active == w_.n_expert &&
+            (int)st.hot_expert_ids.size() == w_.n_expert &&
+            ((st.fused_gate_up && src_gu && src_d) ||
+             (!st.fused_gate_up && src_g && src_u && src_d));
+
+        if (!had_full) {
+            // Fallback: re-upload from mmap (original path).
+            release_hot_storage(st);
+            const auto & regions = moe_hybrid_->layer_regions[(size_t)il];
+            if (!allocate_hot_storage(st, desc, regions, saved.hot_ids,
+                                      saved.cache_slots, false, err)) {
+                mixed_restore_ok_ = false;
+                std::fprintf(stderr,
+                    "[laguna-mixed] FATAL: failed to restore layer %d placement: %s\n",
+                    il, err.c_str());
+                return false;
+            }
+            return true;
+        }
+
+        // Detach full stack from st without freeing yet (D2D source).
+        st.hot_buf = nullptr;
+        st.hot_ctx = nullptr;
+        st.gate_up_hot = st.gate_hot = st.up_hot = st.down_hot = nullptr;
+        free_hot_graphs(st);
+
+        if (!allocate_hot_shell(st, desc, saved.hot_ids, saved.cache_slots, err)) {
+            if (src_buf) ggml_backend_buffer_free(src_buf);
+            if (src_ctx) ggml_free(src_ctx);
+            mixed_restore_ok_ = false;
+            std::fprintf(stderr,
+                "[laguna-mixed] FATAL: failed to restore layer %d placement: %s\n",
+                il, err.c_str());
+            return false;
+        }
+
+        bool ok = true;
+        for (size_t i = 0; ok && i < saved.hot_ids.size(); ++i) {
+            const int32_t id = saved.hot_ids[i];
+            if (st.fused_gate_up) {
+                ok = copy_expert_slice(st.gate_up_hot, (int)i, src_gu, id,
+                                       st.gate_up_expert_bytes) &&
+                     copy_expert_slice(st.down_hot, (int)i, src_d, id,
+                                       st.down_expert_bytes);
+            } else {
+                ok = copy_expert_slice(st.gate_hot, (int)i, src_g, id,
+                                       st.gate_expert_bytes) &&
+                     copy_expert_slice(st.up_hot, (int)i, src_u, id,
+                                       st.up_expert_bytes) &&
+                     copy_expert_slice(st.down_hot, (int)i, src_d, id,
+                                       st.down_expert_bytes);
+            }
+        }
+        ggml_backend_synchronize(backend_);
+        if (src_buf) ggml_backend_buffer_free(src_buf);
+        if (src_ctx) ggml_free(src_ctx);
+
+        if (!ok) {
+            err = "D2D pack of restored hot experts failed";
             mixed_restore_ok_ = false;
             std::fprintf(stderr,
                 "[laguna-mixed] FATAL: failed to restore layer %d placement: %s\n",
@@ -324,6 +525,8 @@ private:
         return true;
     }
 
+    // Stage full 256-expert stack. Prefer D2D reuse of experts already resident
+    // in the compact hot buffer; H2D only the cold remainder from GGUF mmap.
     bool stage_full_layer(int il,
                           PinnedPlacement & saved,
                           std::string & err) {
@@ -331,40 +534,168 @@ private:
         saved.hot_ids = st.hot_expert_ids;
         saved.cache_slots = st.cache_slots;
 
+        // Layer already holds every expert (common under high budget): skip
+        // staging/restore traffic entirely.
+        if (st.hot_active == w_.n_expert &&
+            (int)st.hot_expert_ids.size() == w_.n_expert &&
+            (st.gate_up_hot || st.gate_hot)) {
+            bool identity = true;
+            for (int i = 0; i < w_.n_expert; ++i) {
+                if (st.hot_expert_ids[(size_t)i] != i) {
+                    identity = false;
+                    break;
+                }
+            }
+            if (identity) {
+                if (mixed_verbose()) {
+                    std::fprintf(stderr,
+                        "[laguna-mixed] staged layer %d: already full-stack "
+                        "(skip)\n", il);
+                }
+                return true;
+            }
+        }
+
         ggml_backend_synchronize(backend_);
-        release_hot_storage(st);
 
         const size_t need = staged_layer_bytes(st);
         size_t free_bytes = 0, total_bytes = 0;
         if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
             ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
         }
+        // Peak: old hot + new full briefly coexist for D2D reuse.
+        const size_t old_hot_bytes = st.hot_buf
+            ? ggml_backend_buffer_get_size(st.hot_buf) : 0;
         const size_t reserve = mixed_reserve_bytes();
-        if (free_bytes > 0 && need + reserve > free_bytes) {
-            char msg[256];
-            std::snprintf(msg, sizeof(msg),
-                "layer %d needs %.1f MiB plus %.1f MiB reserve; only %.1f MiB free",
-                il, need / 1048576.0, reserve / 1048576.0,
-                free_bytes / 1048576.0);
-            err = msg;
-            std::string restore_err;
-            restore_pinned_layer(il, saved, restore_err);
-            return false;
+        const size_t peak_extra = need;  // allocate full while old still held
+        if (free_bytes > 0 && peak_extra + reserve > free_bytes) {
+            // Not enough headroom for overlap — free first, bulk H2D fallback.
+            release_hot_storage(st);
+            if (ggml_backend_dev_t dev = ggml_backend_get_device(backend_)) {
+                ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+            }
+            if (free_bytes > 0 && need + reserve > free_bytes) {
+                char msg[256];
+                std::snprintf(msg, sizeof(msg),
+                    "layer %d needs %.1f MiB plus %.1f MiB reserve; only %.1f MiB free",
+                    il, need / 1048576.0, reserve / 1048576.0,
+                    free_bytes / 1048576.0);
+                err = msg;
+                std::string restore_err;
+                restore_pinned_layer(il, saved, restore_err);
+                return false;
+            }
+            std::vector<int32_t> all_ids((size_t)w_.n_expert);
+            std::iota(all_ids.begin(), all_ids.end(), 0);
+            const MoeLayerDesc desc = make_moe_layer_desc(w_.layers[(size_t)il]);
+            const auto & regions = moe_hybrid_->layer_regions[(size_t)il];
+            if (!allocate_hot_storage(st, desc, regions, all_ids, 0, true, err)) {
+                std::string restore_err;
+                restore_pinned_layer(il, saved, restore_err);
+                return false;
+            }
+            if (mixed_verbose()) {
+                std::fprintf(stderr,
+                    "[laguna-mixed] staged layer %d: %d experts, %.1f MiB (bulk H2D)\n",
+                    il, w_.n_expert, need / 1048576.0);
+            }
+            return true;
         }
+
+        // Keep old compact hot as D2D source.
+        ggml_tensor * old_gu = st.gate_up_hot;
+        ggml_tensor * old_g  = st.gate_hot;
+        ggml_tensor * old_u  = st.up_hot;
+        ggml_tensor * old_d  = st.down_hot;
+        ggml_backend_buffer_t old_buf = st.hot_buf;
+        ggml_context * old_ctx = st.hot_ctx;
+        std::vector<int32_t> old_local = st.hot_local_by_global;
+        const bool can_d2d = old_buf && !old_local.empty() &&
+            ((st.fused_gate_up && old_gu && old_d) ||
+             (!st.fused_gate_up && old_g && old_u && old_d));
+
+        st.hot_buf = nullptr;
+        st.hot_ctx = nullptr;
+        st.gate_up_hot = st.gate_hot = st.up_hot = st.down_hot = nullptr;
+        free_hot_graphs(st);
 
         std::vector<int32_t> all_ids((size_t)w_.n_expert);
         std::iota(all_ids.begin(), all_ids.end(), 0);
         const MoeLayerDesc desc = make_moe_layer_desc(w_.layers[(size_t)il]);
         const auto & regions = moe_hybrid_->layer_regions[(size_t)il];
-        if (!allocate_hot_storage(st, desc, regions, all_ids, 0, true, err)) {
-            std::string restore_err;
-            restore_pinned_layer(il, saved, restore_err);
+
+        if (!allocate_hot_shell(st, desc, all_ids, 0, err)) {
+            // Put old buffer back if allocation failed.
+            st.hot_buf = old_buf;
+            st.hot_ctx = old_ctx;
+            st.gate_up_hot = old_gu;
+            st.gate_hot = old_g;
+            st.up_hot = old_u;
+            st.down_hot = old_d;
+            st.hot_local_by_global = old_local;
             return false;
         }
+
+        int n_d2d = 0, n_h2d = 0;
+        bool ok = true;
+        for (int id = 0; ok && id < w_.n_expert; ++id) {
+            const int32_t local = (id < (int)old_local.size()) ? old_local[(size_t)id] : -1;
+            if (can_d2d && local >= 0) {
+                if (st.fused_gate_up) {
+                    ok = copy_expert_slice(st.gate_up_hot, id, old_gu, local,
+                                           st.gate_up_expert_bytes) &&
+                         copy_expert_slice(st.down_hot, id, old_d, local,
+                                           st.down_expert_bytes);
+                } else {
+                    ok = copy_expert_slice(st.gate_hot, id, old_g, local,
+                                           st.gate_expert_bytes) &&
+                         copy_expert_slice(st.up_hot, id, old_u, local,
+                                           st.up_expert_bytes) &&
+                         copy_expert_slice(st.down_hot, id, old_d, local,
+                                           st.down_expert_bytes);
+                }
+                ++n_d2d;
+            } else {
+                if (st.fused_gate_up) {
+                    ok = upload_single_expert(st.gate_up_hot, id,
+                                              regions.gate_up_exps,
+                                              st.gate_up_expert_bytes, id, err) &&
+                         upload_single_expert(st.down_hot, id,
+                                              regions.down_exps,
+                                              st.down_expert_bytes, id, err);
+                } else {
+                    ok = upload_single_expert(st.gate_hot, id, regions.gate_exps,
+                                              st.gate_expert_bytes, id, err) &&
+                         upload_single_expert(st.up_hot, id, regions.up_exps,
+                                              st.up_expert_bytes, id, err) &&
+                         upload_single_expert(st.down_hot, id, regions.down_exps,
+                                              st.down_expert_bytes, id, err);
+                }
+                ++n_h2d;
+            }
+        }
+        ggml_backend_synchronize(backend_);
+        if (old_buf) ggml_backend_buffer_free(old_buf);
+        if (old_ctx) ggml_free(old_ctx);
+
+        if (!ok) {
+            release_hot_storage(st);
+            std::string restore_err;
+            // saved placement; reload from mmap
+            if (!allocate_hot_storage(st, desc, regions, saved.hot_ids,
+                                      saved.cache_slots, false, restore_err)) {
+                mixed_restore_ok_ = false;
+            }
+            if (err.empty()) err = "staged expert fill failed";
+            return false;
+        }
+
         if (mixed_verbose()) {
             std::fprintf(stderr,
-                "[laguna-mixed] staged layer %d: %d experts, %.1f MiB\n",
-                il, w_.n_expert, need / 1048576.0);
+                "[laguna-mixed] staged layer %d: %d experts, %.1f MiB "
+                "(D2D=%d H2D=%d, peak_old=%.1f MiB)\n",
+                il, w_.n_expert, need / 1048576.0, n_d2d, n_h2d,
+                old_hot_bytes / 1048576.0);
         }
         return true;
     }
@@ -832,6 +1163,11 @@ private:
                     error = restore_error;
                     layer_ok = false;
                 }
+            }
+            // Drop full-stack MoE graphs (can be hundreds of MiB at large
+            // chunks). Decode rebuilds compact graphs on demand.
+            if (!dense) {
+                free_hot_graphs(moe_hybrid_->layers[(size_t)il]);
             }
             if (!layer_ok) {
                 step_graph_destroy(prefn);
