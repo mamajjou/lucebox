@@ -294,7 +294,7 @@ bool load_target_gguf_laguna_partial(const std::string & path,
     if ((int)n_layer <= (int)(sizeof(out.n_head_arr)/sizeof(out.n_head_arr[0]))) {
         for (uint32_t i = 0; i < n_layer; ++i) out.n_head_arr[i] = (int)heads_per_layer[i];
     } else {
-        set_last_error("laguna: n_layer exceeds compiled-in n_head_arr capacity (40)");
+        set_last_error("laguna: n_layer exceeds compiled-in n_head_arr capacity (64)");
         gguf_free(gctx); return false;
     }
 

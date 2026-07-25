@@ -112,8 +112,14 @@ struct LagunaTargetWeights {
     int  swa_pattern          = 4;     // (full, sw, sw, sw) repeating
 
     // Per-layer head count: 48 (full) / 64 (sliding). Always n_layer entries.
-    int  n_head_arr[40]       = { 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64,
-                                  48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64 };
+    // Capacity 64 covers Laguna-S (48 layers) and leaves headroom for larger
+    // variants; the loader copies only the first n_layer entries from GGUF.
+    int  n_head_arr[64]       = {
+        48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64,
+        48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64,
+        48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64, 48,64,64,64,
+        48,64,64,64,
+    };
 
     // RoPE per layer-type.
     float rope_freq_base_full = 500000.0f;
