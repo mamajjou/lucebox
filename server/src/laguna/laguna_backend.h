@@ -18,6 +18,7 @@
 #include "kvflash_scorer.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_types_impl.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 #include "../common/moe_hybrid_stream.h"
@@ -97,7 +98,7 @@ public:
 
 private:
     // The opt-in mixed backend deliberately reuses the exact same model,
-    // cache, placement and decode state.  Friendship keeps that integration
+    // cache, placement and decode state. Friendship keeps that integration
     // explicit without widening the public backend API.
     friend class LagunaMixedBackend;
 
