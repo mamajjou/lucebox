@@ -88,10 +88,22 @@ static void resolve_laguna_kv_types(const LagunaBackendArgs & args,
     }
 }
 
+// Head-major KV ([head_dim*n_head_kv, max_ctx]) is a CUDA-graph-friendly
+// layout. On HIP/gfx1100 it currently illegal-accesses on the first hybrid
+// graph (flash-attn / set_rows path) even for a one-token prompt — see
+// mamajjou/lucebox PR #1 validation. Default OFF on HIP; opt in with
+// DFLASH_LAGUNA_AUTO_HEAD_MAJOR=1 or DFLASH_LAGUNA_KV_HEAD_MAJOR=1.
+// CUDA keeps the previous default-ON behaviour (disable with =0).
 static bool laguna_auto_head_major_enabled() {
     static const bool enabled = []() {
         const char * e = std::getenv("DFLASH_LAGUNA_AUTO_HEAD_MAJOR");
-        return !(e && std::string(e) == "0");
+        if (e && e[0] == '0' && e[1] == '\0') return false;
+        if (e && e[0] == '1' && e[1] == '\0') return true;
+#if defined(DFLASH27B_BACKEND_HIP) || defined(GGML_USE_HIP)
+        return false;
+#else
+        return true;
+#endif
     }();
     return enabled;
 }

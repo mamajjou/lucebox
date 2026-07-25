@@ -317,6 +317,17 @@ sliced into ≤4-token sub-batches (forcing the stable MMVQ path); **decode**
 (single-token) is unaffected. This costs some prefill throughput on split
 layers and is removed once the kernel is fixed upstream.
 
+### Caveat: head-major KV layout on HIP
+
+`DFLASH_LAGUNA_AUTO_HEAD_MAJOR` defaults **off on HIP** (on CUDA it remains
+default-on). The head-major cache layout (`DFLASH_LAGUNA_KV_HEAD_MAJOR`)
+illegal-accesses on the first hybrid graph on gfx1100 even for a one-token
+prompt — placement and stream-engine init succeed, then
+`ggml_backend_graph_compute` → `hipStreamSynchronize` reports
+`device: -1`. Use the legacy per-head layout on ROCm until the FA / set_rows
+path is fixed. Force the experimental layout only with an explicit
+`DFLASH_LAGUNA_KV_HEAD_MAJOR=1` (or `AUTO_HEAD_MAJOR=1`).
+
 ## Laguna-XS.2 target (experimental, Poolside MoE)
 
 [Poolside Laguna-XS.2](https://huggingface.co/poolside/Laguna-XS.2) is a 40-layer MoE LLM with 256 experts (top-8) plus an always-on shared expert, per-layer head counts `[48,64,64,64]×10`, and a per-layer SWA pattern (window 512). It is **architecturally distinct from `qwen35`**, so dflash adds a hand-rolled CUDA forward path (`Path A`, ggml-only — no libllama dependency) that mirrors the qwen35 stack. The Q4_K_M GGUF lands at 18.77 GiB on a single RTX 3090; tok_embd stays CPU-only (110 MiB) to keep the GPU budget under 24 GB.
