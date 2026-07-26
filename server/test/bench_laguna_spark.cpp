@@ -1,15 +1,16 @@
-// Laguna Spark decode bench: drives LagunaBackend (the REAL hybrid/spark
-// path used by dflash_server), honoring all DFLASH_* env knobs:
+// Laguna Spark decode bench: drives LagunaMixedBackend (same hybrid/spark
+// path as dflash_server), honoring all DFLASH_* env knobs:
 //   DFLASH_LAGUNA_HOTNESS=<csv>     calibrated placement
 //   DFLASH_EXPERT_BUDGET_PCT=60     pinned-hot fraction
 //   DFLASH_LAGUNA_CACHE_SLOTS=16    cache ring slots/layer
 //   DFLASH_LAGUNA_PROFILE=1         cold-experts/token profiling
 //   DFLASH_LAGUNA_NO_SINGLE_GRAPH=1 per-layer fallback (for trace capture)
 //   DFLASH_LAGUNA_PREGATE_TRACE=<f> pregate trace capture (fallback path)
+//   DFLASH_LAGUNA_MIXED_PREFILL=1   staged full-GPU prefill + hybrid decode
 //
 // Usage: bench_laguna_spark <laguna.gguf> [prompt_N=128] [n_gen=256]
 
-#include "laguna_backend.h"
+#include "laguna_mixed_backend.h"
 #include "dflash27b.h"
 
 #include <algorithm>
@@ -32,7 +33,9 @@ int main(int argc, char ** argv) {
     args.target_path = argv[1];
     args.max_ctx     = prompt_N + n_gen + 64;
 
-    LagunaBackend be(args);
+    // LagunaMixedBackend is identical to LagunaBackend unless
+    // DFLASH_LAGUNA_MIXED_PREFILL=1 (matches dflash_server factory path).
+    LagunaMixedBackend be(args);
     if (!be.init()) {
         std::fprintf(stderr, "backend init failed\n");
         return 1;

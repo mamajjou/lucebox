@@ -5,7 +5,7 @@
 
 #include "qwen35_backend.h"
 #include "qwen35moe_backend.h"
-#include "laguna_backend.h"
+#include "laguna_mixed_backend.h"
 #include "laguna_layer_split_adapter.h"
 #include "qwen3_backend.h"
 #include "gemma4_backend.h"
@@ -42,7 +42,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
     const std::string arch = detect_arch(args.model_path);
     if (arch.empty()) {
         std::fprintf(stderr, "[backend_factory] failed to detect architecture from %s\n",
-                     args.model_path);
+                      args.model_path);
         return nullptr;
     }
 
@@ -166,7 +166,11 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
         lcfg.chunk       = args.chunk;
         // kv_type defaults to Q8_0 in LagunaBackendArgs
 
-        auto backend = std::make_unique<LagunaBackend>(lcfg);
+        // LagunaMixedBackend is behavior-identical to LagunaBackend unless
+        // DFLASH_LAGUNA_MIXED_PREFILL=1 is set.  The opt-in path stages one
+        // complete MoE layer for batched GPU prefill, then restores the
+        // persistent hybrid placement for decode.
+        auto backend = std::make_unique<LagunaMixedBackend>(lcfg);
         if (!backend->init()) {
             std::fprintf(stderr, "[backend_factory] LagunaBackend init failed\n");
             return nullptr;
@@ -278,7 +282,7 @@ std::unique_ptr<ModelBackend> create_backend(const BackendArgs & args) {
 
     } else {
         std::fprintf(stderr, "[backend_factory] unsupported architecture: %s\n",
-                     arch.c_str());
+                      arch.c_str());
         return nullptr;
     }
 }

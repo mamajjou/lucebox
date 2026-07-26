@@ -18,6 +18,7 @@
 #include "kvflash_scorer.h"
 #include "../common/moe_hybrid_ffn_eval.h"
 #include "../common/moe_hybrid_storage.h"
+#include "../common/moe_hybrid_types_impl.h"
 #include "../common/moe_hybrid_routing_stats.h"
 #include "../common/moe_hybrid_swap_manager.h"
 #include "../common/moe_hybrid_stream.h"
@@ -33,6 +34,8 @@
 #include <vector>
 
 namespace dflash::common {
+
+class LagunaMixedBackend;
 
 struct LagunaBackendArgs {
     std::string target_path;
@@ -94,6 +97,11 @@ public:
     const MoeHybridRoutingStats * get_routing_stats() const override { return routing_stats_.get(); }
 
 private:
+    // The opt-in mixed backend deliberately reuses the exact same model,
+    // cache, placement and decode state. Friendship keeps that integration
+    // explicit without widening the public backend API.
+    friend class LagunaMixedBackend;
+
     LagunaBackendArgs                           args_;
     ggml_backend_t                              backend_   = nullptr;
     ggml_backend_t                              snap_backend_ = nullptr;
